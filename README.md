@@ -22,3 +22,8 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o m
 
 The decoy QUIC Initial in `cmd/mgprobe/fake/` and the ideas behind several strategies come from zapret2 by bol-van
 (MIT License, see `cmd/mgprobe/fake/LICENSE.zapret2.txt`).
+
+## License
+
+GNU Affero General Public License v3.0, the same as the Mistgate panel and client: see `LICENSE`. Third-party
+material is listed in `NOTICE`.

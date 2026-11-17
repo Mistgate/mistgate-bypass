@@ -1,0 +1,2 @@
+The decoy QUIC Initial in cmd/mgprobe/fake/ and the ideas behind several strategies come from zapret2 by bol-van,
+Copyright (c) 2016-2026 bol-van, MIT License: see cmd/mgprobe/fake/LICENSE.zapret2.txt.
