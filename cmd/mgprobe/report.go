@@ -17,7 +17,7 @@ func render(rep *Report) string {
 	ladder := dpi.LadderSeed(probeSeed)
 
 	w("mgprobe v%s: отчёт о доступности сервисов", rep.Version)
-	w("Дата и время: %s    Windows: %s    Длительность: %d с    Зерно случайных разрезов: %d", rep.Time, rep.Windows, rep.ElapsedSec, rep.Seed)
+	w("Дата и время: %s    Система: %s    Длительность: %d с    Зерно случайных разрезов: %d", rep.Time, rep.OS, rep.ElapsedSec, rep.Seed)
 	w("")
 	w("Провайдер: ____")
 	w("Город: ____")

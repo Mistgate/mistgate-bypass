@@ -13,9 +13,9 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func windowsVersion() string {
+func osVersion() string {
 	v := windows.RtlGetVersion()
-	return fmt.Sprintf("%d.%d (build %d)", v.MajorVersion, v.MinorVersion, v.BuildNumber)
+	return fmt.Sprintf("Windows %d.%d (build %d)", v.MajorVersion, v.MinorVersion, v.BuildNumber)
 }
 
 // setupConsole switches the console to UTF-8 so the non-Latin progress lines are readable.

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"os/user"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -485,8 +486,10 @@ func TestEnvironment(t *testing.T) {
 	if strings.Join(got, ",") != "mistgate-clientd,sing-box,tailscaled,winws" {
 		t.Errorf("tools: %v", got)
 	}
-	if len(bypassTools) != 32 {
-		t.Errorf("%d names in the list", len(bypassTools))
+	for i, n := range bypassTools { // matchTools compares lower-case names
+		if n != strings.ToLower(n) || slices.Index(bypassTools, n) != i {
+			t.Errorf("bad or repeated name in the list: %q", n)
+		}
 	}
 	// An environment with a finding says so loudly; a clean one says nothing is wrong.
 	e := Environment{Distorted: true, Reasons: []string{"запущены программы обхода или VPN: winws"}, WinDivert: "unknown"}
@@ -563,7 +566,7 @@ func TestQUICVariants(t *testing.T) {
 }
 
 func syntheticReport() *Report {
-	rep := &Report{Tool: "mgprobe", Version: version, Time: "2026-01-01T00:00:00Z", Windows: "10.0 (build 1)", ElapsedSec: 1, Seed: probeSeed,
+	rep := &Report{Tool: "mgprobe", Version: version, Time: "2026-01-01T00:00:00Z", OS: "10.0 (build 1)", ElapsedSec: 1, Seed: probeSeed,
 		Environment: Environment{Distorted: true, Reasons: []string{"запущены программы обхода или VPN: warp-svc"}, Tools: []string{"warp-svc"}, WinDivert: "not-loaded"}}
 	for _, s := range services {
 		for _, h := range s.Hosts {

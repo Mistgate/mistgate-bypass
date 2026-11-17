@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	version    = "2"
+	version    = "3"
 	reportName = "mgprobe-report.txt"
 
 	// probeSeed fixes the random cut points of the strategies, so a run can be repeated; the report states it.
@@ -131,4 +131,9 @@ const (
 var bypassTools = []string{"winws", "winws2", "goodbyedpi", "ciadpi", "byedpi", "spoofdpi", "zapret", "warp-svc", "tailscaled",
 	"wireguard", "openvpn", "amneziavpn", "amneziawg", "mistgate-clientd", "sing-box", "xray", "v2ray", "v2rayn", "nekoray",
 	"nekobox", "hiddify", "clash", "mihomo", "clash-verge", "outline", "psiphon", "lantern", "tor", "proxifier", "happ",
-	"throne", "karing"}
+	"throne", "karing",
+	// as the programs are named on macOS and Linux
+	"cloudflarewarp", "cloudflare warp", "wireguard-go", "tailscale", "ipnextension", "tunnelblick", "viscosity", "clashx",
+	"clashx pro", "clashx meta", "clash verge", "clash-verge-service", "v2rayu", "v2box", "v2raya", "shadowrocket", "surge",
+	"foxray", "streisand", "tpws", "nfqws", "nfqws2", "dvtws", "dvtws2", "openvpn connect", "protonvpn", "nordvpn",
+	"mullvad vpn", "expressvpn", "adguard vpn", "outline client"}

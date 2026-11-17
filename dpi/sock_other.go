@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !unix
 
 package dpi
 
@@ -8,7 +8,7 @@ import (
 	"syscall"
 )
 
-// Socket options are implemented for Windows only; on other systems plans that need them fail early.
+// Socket options are implemented for Windows and Unix systems; elsewhere plans that need them fail early.
 func setTTL(syscall.Conn, bool, int) error   { return errors.ErrUnsupported }
 func getTTL(syscall.Conn, bool) (int, error) { return 0, errors.ErrUnsupported }
 func sendOOB(*net.TCPConn, []byte) error     { return errors.ErrUnsupported }

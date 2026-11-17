@@ -23,7 +23,7 @@ type Report struct {
 	Tool        string        `json:"tool"`
 	Version     string        `json:"version"`
 	Time        string        `json:"time"`
-	Windows     string        `json:"windows"`
+	OS          string        `json:"os"`
 	ElapsedSec  int           `json:"elapsed_s"`
 	Seed        int           `json:"seed"`
 	Environment Environment   `json:"environment"`
@@ -71,7 +71,7 @@ func reportPath() string {
 // test follows the matrix. The time budget: environment 5 s, DNS 15 s, the matrix 270 s, speed 14 s.
 func (p *prober) run(ctx context.Context) *Report {
 	start := time.Now()
-	rep := &Report{Tool: "mgprobe", Version: version, Time: start.Format(time.RFC3339), Windows: windowsVersion(), Seed: probeSeed}
+	rep := &Report{Tool: "mgprobe", Version: version, Time: start.Format(time.RFC3339), OS: osVersion(), Seed: probeSeed}
 	ctx, cancel := context.WithTimeout(ctx, 340*time.Second)
 	defer cancel()
 
