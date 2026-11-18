@@ -55,7 +55,7 @@ func TestUnfilteredNameOpensWithOneConnection(t *testing.T) {
 }
 
 // 2. A filter that reads each TLS record alone: the first strategy of the list for the country gets by, memory
-// keeps it, and the next connection uses it at once, with no ordinary one before. The count of wins grows. The
+// keeps it, and the next connection uses it at once, with no ordinary one before. Only the ladder counts a win. The
 // ClientHello is the default of crypto/tls, longer than a segment.
 func TestFilterOfOneKindOpensWithTheFirstOfTheList(t *testing.T) {
 	e := newEnv(t, dpitest.NameInOneRecord(dpitest.OutOfBand, "example.org"), dpitest.Silence, "ru")
@@ -71,7 +71,7 @@ func TestFilterOfOneKindOpensWithTheFirstOfTheList(t *testing.T) {
 	if s != 6 || !slices.Equal(e.started(), []int{6}) || e.flt.Accepted() != before+1 {
 		t.Errorf("the second time: strategy %d, started %v, %d new connections", s, e.started(), e.flt.Accepted()-before)
 	}
-	if w := e.mem.cur.wins[6]; w != 2 {
+	if w := e.mem.cur.wins[6]; w != 1 { // only the ladder counts
 		t.Errorf("wins of 6: %d", w)
 	}
 }
@@ -114,7 +114,7 @@ func TestAnotherFilterAnotherWinner(t *testing.T) {
 }
 
 // 4. A name that cannot be reached at all is not run through the ladder: no connection, no strategy, the error says
-// which kind of failure it is, and for as long as the address is left alone it fails at once.
+// which kind of failure it is, and for as long as the address is left alone it is tried for TMax only.
 func TestUnreachableAddressStopsTheLadder(t *testing.T) {
 	e := newEnv(t, dpitest.Never, dpitest.Silence, "ru")
 	var dials atomic.Int32
@@ -133,18 +133,19 @@ func TestUnreachableAddressStopsTheLadder(t *testing.T) {
 	}
 	t0 = time.Now()
 	_, err = e.fetch(ctx, "video.example.org")
-	if !errors.Is(err, ErrUnreachable) || time.Since(t0) > tBudget/4 || dials.Load() != 1 {
+	if !errors.Is(err, ErrUnreachable) || time.Since(t0) > tBudget/2 || dials.Load() != 2 {
 		t.Errorf("the second time: %v after %v, %d dials", err, time.Since(t0), dials.Load())
 	}
 	e.clk.Advance(5*time.Minute + time.Second)
-	if _, err = e.fetch(ctx, "video.example.org"); !errors.Is(err, ErrUnreachable) || dials.Load() != 2 {
-		t.Errorf("after the pause: %v, %d dials", err, dials.Load())
+	t0 = time.Now()
+	if _, err = e.fetch(ctx, "video.example.org"); !errors.Is(err, ErrUnreachable) || time.Since(t0) < tBudget/2 || dials.Load() != 3 {
+		t.Errorf("after the pause: %v after %v, %d dials", err, time.Since(t0), dials.Load())
 	}
 	if len(e.started()) != 0 || e.flt.Accepted() != 0 {
 		t.Errorf("connections were made: %v", e.started())
 	}
 
-	// A refusal is as good as silence, and as quick.
+	// A refusal is as quick as silence, and as unreachable; it is not remembered, being as quick the second time.
 	e.dial = func(context.Context) (*net.TCPConn, error) {
 		return nil, errors.New("connection refused to 192.0.2.1:443")
 	}

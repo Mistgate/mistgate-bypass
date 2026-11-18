@@ -92,6 +92,7 @@ func newEnv(t *testing.T, pred dpitest.Predicate, act dpitest.Action, country st
 	e := &env{t: t, clk: newClock()}
 	e.flt = dpitest.New(t, srv.Listener.Addr().String(), pred, act)
 	e.mem = OpenMemory("", e.clk.Now)
+	e.mem.SetNetwork("env")
 	cfg := Config{
 		Memory:  e.mem,
 		Country: func() string { return country },

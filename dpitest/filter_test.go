@@ -221,3 +221,34 @@ func waitFor(t *testing.T, ok func() bool) {
 		}
 	}
 }
+
+// The urgent byte of a client that writes at once is inline for the filter, however late the filter gets to its
+// connection: a flight that is already queued, urgent byte included, when the socket is accepted still reads as
+// the payload the plan sends. (Setting the option on the accepted socket instead failed with "an invalid argument"
+// on Windows whenever the client was quicker than the filter's goroutine: the flaky TestPredicates of the review.)
+func TestUrgentByteIsInlineForAQueuedFlight(t *testing.T) {
+	ln, err := listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := dpi.Execute(c.(*net.TCPConn), dpi.Plan{{Data: []byte("ab")}, {Data: []byte("U"), OOB: true}, {Data: []byte("cd")}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the whole flight is queued before the connection is accepted
+	s, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got := make([]byte, 5)
+	s.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := readFull(s, got); err != nil || string(got) != "abUcd" {
+		t.Errorf("read %q, %v", got, err)
+	}
+}

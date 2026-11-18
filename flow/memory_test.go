@@ -21,7 +21,7 @@ var (
 
 func win(m *Memory, t target, first, winner int, src source) change {
 	nm, _ := m.plan(t)
-	return m.record(nm, verdict{t: t, first: first, src: src, winner: winner, pause: time.Minute})
+	return m.record(nm, verdict{t: t, first: first, src: src, winner: winner, ladder: first != winner, pause: time.Minute})
 }
 
 // What the file holds: the results of service parts and own sites, the wins, a salt; the names of the sites that
@@ -119,11 +119,14 @@ func TestDamagedFileIsAnEmptyMemory(t *testing.T) {
 			if len(m.Parts()) != 0 || m.Salt() == [32]byte{} {
 				t.Fatalf("parts %v, salt %x", m.Parts(), m.Salt())
 			}
+			m.SetNetwork("t")
 			win(m, target{name: "a.googlevideo.com", part: partVideo}, 1, 6, srcNone)
 			if err := m.Save(); err != nil {
 				t.Fatal(err)
 			}
-			if m2 := OpenMemory(path, newClock().Now); len(m2.Parts()) != 1 {
+			m2 := OpenMemory(path, newClock().Now)
+			m2.SetNetwork("t")
+			if len(m2.Parts()) != 1 {
 				t.Errorf("the file was not repaired: %v", m2.Parts())
 			}
 		})
@@ -172,7 +175,7 @@ func TestMemoryForgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	m2 := OpenMemory(path, clk.Now)
-	if len(m2.nets) > maxNets+1 { // and the empty one the caller starts on
+	if len(m2.nets) > maxNets {
 		t.Errorf("%d networks after a restart", len(m2.nets))
 	}
 	if m2.SetNetwork("net0") || !m2.SetNetwork("net39") {
@@ -181,7 +184,7 @@ func TestMemoryForgets(t *testing.T) {
 
 	clk.Advance(31 * 24 * time.Hour)
 	m3 := OpenMemory(path, clk.Now)
-	if len(m3.nets) != 1 {
+	if len(m3.nets) != 0 {
 		t.Errorf("networks of a month ago are kept: %d", len(m3.nets))
 	}
 
@@ -207,6 +210,7 @@ func TestMemoryForgets(t *testing.T) {
 func TestResultGrowsStale(t *testing.T) {
 	clk := newClock()
 	m := OpenMemory("", clk.Now)
+	m.SetNetwork("t")
 	tg := target{name: "a.googlevideo.com", part: partVideo}
 	win(m, tg, 1, 6, srcNone)
 	clk.Advance(6 * 24 * time.Hour)
@@ -228,6 +232,7 @@ func TestResultGrowsStale(t *testing.T) {
 func TestDownNamesAreLeftAloneForAWhile(t *testing.T) {
 	clk := newClock()
 	m := OpenMemory("", clk.Now)
+	m.SetNetwork("t")
 	tg := target{name: "a.example.org"}
 	nm, _ := m.plan(tg)
 	m.record(nm, verdict{t: tg, first: 1, pause: 10 * time.Minute})
@@ -275,6 +280,7 @@ func TestResultOfAnotherNetworkIsDropped(t *testing.T) {
 // starts the count again.
 func TestGuardDropsAPartAfterThreeInARow(t *testing.T) {
 	m := OpenMemory("", newClock().Now)
+	m.SetNetwork("t")
 	part := target{name: "a.googlevideo.com", part: partVideo}
 	win(m, part, 1, 6, srcNone)
 	for i, name := range []string{"b", "c", "d"} {
@@ -295,25 +301,37 @@ func TestGuardDropsAPartAfterThreeInARow(t *testing.T) {
 		t.Errorf("%+v %v", ch, m.Parts())
 	}
 
-	// A name that nothing opens counts against the strategy it started with, too.
-	m2 := OpenMemory("", newClock().Now)
+}
+
+// A ladder in which nothing answered, not even the ordinary connection, says that the network or the site is down,
+// and nothing about the strategy the name started with: three of them in a row do not make it forgotten.
+func TestNothingAnsweringDoesNotCountAgainstAStrategy(t *testing.T) {
+	m := OpenMemory("", newClock().Now)
+	m.SetNetwork("t")
 	own := target{name: "mine.example.org", own: true}
-	win(m2, own, 1, 3, srcNone)
-	for range 3 {
-		nm, _ := m2.plan(own)
-		m2.record(nm, verdict{t: own, first: 3, src: srcName, pause: 0})
+	part := target{name: "rr1.googlevideo.com", part: partVideo}
+	win(m, own, 1, 3, srcNone)
+	win(m, part, 1, 6, srcNone)
+	for range 5 {
+		for _, tg := range []target{own, {name: "rr2.googlevideo.com", part: partVideo}} {
+			nm, h := m.plan(tg)
+			if ch := m.record(nm, verdict{t: tg, first: h.first, src: h.src, pause: time.Minute}); ch.broken != 0 {
+				t.Fatalf("%+v", ch)
+			}
+		}
 	}
-	if _, h := m2.plan(own); h.first != 1 {
-		t.Errorf("an own site that nothing opens keeps its strategy: %+v", h)
+	if _, h := m.plan(own); h.first != 3 {
+		t.Errorf("an own site that nothing opened lost its strategy: %+v", h)
 	}
-	if _, _, ok := m2.Site("mine.example.org"); ok {
-		t.Error("the site is still on the list to be written")
+	if p := m.Parts(); len(p) != 1 || p[0].Strategy != 6 {
+		t.Errorf("a part that nothing opened lost its strategy: %+v", p)
 	}
 }
 
 // The strategies that lose to plain go to the end, the ones that win come first.
 func TestRankPutsWinnersFirstAndHarmfulLast(t *testing.T) {
 	m := OpenMemory("", newClock().Now)
+	m.SetNetwork("t")
 	nm, _ := m.plan(target{})
 	cands := []dpi.Strategy{{Num: 6}, {Num: 16}, {Num: 8}, {Num: 15}}
 	nm.wins = map[int]int{8: 5, 16: 1}
@@ -332,6 +350,7 @@ func TestRankPutsWinnersFirstAndHarmfulLast(t *testing.T) {
 func TestNamesAreBounded(t *testing.T) {
 	clk := newClock()
 	m := OpenMemory("", clk.Now)
+	m.SetNetwork("t")
 	nm, _ := m.plan(target{})
 	for i := range maxNames + 100 {
 		clk.Advance(time.Millisecond)
@@ -350,6 +369,7 @@ func TestNamesAreBounded(t *testing.T) {
 func TestMemoryIsSafeForConcurrentUse(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bypass.json")
 	m := OpenMemory(path, nil)
+	m.SetNetwork("t")
 	var wg sync.WaitGroup
 	for g := range 8 {
 		wg.Add(1)
@@ -386,11 +406,40 @@ func TestSaveFailureKeepsTheMemoryDirty(t *testing.T) {
 	blocker := filepath.Join(dir, "file")
 	os.WriteFile(blocker, nil, 0o600)
 	m := OpenMemory(filepath.Join(blocker, "bypass.json"), nil) // a directory cannot be made under a file
+	m.SetNetwork("t")
 	win(m, target{name: "a.googlevideo.com", part: partVideo}, 1, 6, srcNone)
 	if err := m.Save(); err == nil {
 		t.Fatal("no error")
 	}
 	if !m.dirty {
 		t.Error("a failed write forgot that there is something to write")
+	}
+}
+
+// A strategy that keeps working is not a reason to write the file: confirmations that change nothing are not
+// written, and the count of its wins is written once, when the strategy is new to the network, and then once an hour.
+func TestRememberedStrategyKeepsTheFileQuiet(t *testing.T) {
+	clk := newClock()
+	m := OpenMemory(filepath.Join(t.TempDir(), "bypass.json"), clk.Now)
+	m.SetNetwork("a")
+	tg := target{name: "a.googlevideo.com", part: partVideo}
+	win(m, tg, 1, 6, srcNone) // the ladder that found it
+	if err := m.Save(); err != nil || m.dirty {
+		t.Fatalf("save: %v, dirty %v", err, m.dirty)
+	}
+	for i := range 5 {
+		win(m, tg, 6, 6, srcPart) // the connections that went straight to it
+		if m.dirty {
+			t.Fatalf("connection %d made the memory dirty", i)
+		}
+	}
+	win(m, tg, 1, 6, srcNone) // another ladder, minutes later: the count grows in RAM only
+	if m.dirty || m.cur.wins[6] != 2 {
+		t.Errorf("dirty %v, wins %v", m.dirty, m.cur.wins)
+	}
+	clk.Advance(touchEach + time.Minute)
+	win(m, tg, 1, 6, srcNone)
+	if !m.dirty {
+		t.Error("an hour later the count was still not written")
 	}
 }

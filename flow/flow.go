@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -28,7 +29,8 @@ import (
 // The ladder gave up. Both errors carry no name and no address; the cause is the error itself.
 var (
 	// ErrUnreachable: no connection could be made at all (no answer to the SYN, a refusal, no route). Nothing but
-	// the address can be wrong, and no strategy changes that: the ladder does not run.
+	// the address can be wrong, and no strategy changes that: the ladder does not run. Only a timeout is remembered,
+	// and then only as a reason to try the name for less time (Timing.UnreachFor).
 	ErrUnreachable = errors.New("flow: unreachable")
 	// ErrNoWay: connections were made and none was answered: within the budget, with the ordinary connection and the
 	// strategies tried; or within T, for a name that has just been found to be down; or each one was broken by the
@@ -48,6 +50,13 @@ type Result struct {
 	First []byte
 	// Strategy is the number of the strategy that opened it; 1 is the ordinary connection.
 	Strategy int
+	// Silent: the server has not answered yet, and First is empty. It is only ever set when Config.NoFallback says
+	// there is nowhere else to send the flow: the budget is over, the ladder has found nothing, and the connection
+	// that is still open (the ordinary one, if there is one) is given back as it is, so that the application waits
+	// for the server as it would without the ladder. The caller copies bytes both ways, and must put its usual idle
+	// limit on the connection: Open has none to add. That is the limit of the wait, and a good one, because it is
+	// the application's own: a browser gives up on a connection when it chooses to.
+	Silent bool
 }
 
 // Timing holds the numbers of the ladder. A zero field takes the default, which is the number of the plan.
@@ -58,11 +67,20 @@ type Timing struct {
 	TMin, TMax, TSlack time.Duration
 	// Budget is the time the whole ladder of one connection has, dialling included. (plan 3.2: 8 s)
 	Budget time.Duration
-	// DeadFor is how long a name that nothing opened is left alone; UnreachFor the same for an address that did not
-	// answer. (plan 3.2: 10 min, 5 min)
+	// DeadFor is how long a name that nothing opened (at the address it was tried at) gets no ladder, only the
+	// ordinary connection for T; UnreachFor how long a name whose connection timed out is tried for TMax only, with
+	// no more than the first connection. Both end at once with an answer, and with SetNetwork. (plan 3.2: 10 min,
+	// 5 min)
 	DeadFor, UnreachFor time.Duration
 	// MaxAttempts is how many connections one ladder opens, the ordinary one included. (plan 3.2: 5)
 	MaxAttempts int
+	// A name whose ordinary connection answered after T, with a ladder running beside it, is slow and not blocked: the
+	// next connections to it (and to its service part) wait SlowFactor times as long as that took, but at least T
+	// and at most SlowMax, before they start a ladder. Without it each of them would open the ladder's connections
+	// again, on a network that is slow just because it is loaded. (review F3: 1.5 times; half the budget, so that a
+	// ladder that is needed still has the other half)
+	SlowFactor float64
+	SlowMax    time.Duration
 	// MaxLadders is how many ladders run at once in all. (plan 3.2: 32)
 	MaxLadders int
 }
@@ -79,6 +97,10 @@ func (t Timing) withDefaults() Timing {
 	def(&t.Budget, 8*time.Second)
 	def(&t.DeadFor, 10*time.Minute)
 	def(&t.UnreachFor, 5*time.Minute)
+	def(&t.SlowMax, t.Budget/2)
+	if t.SlowFactor <= 0 {
+		t.SlowFactor = 1.5
+	}
 	if t.MaxAttempts <= 0 {
 		t.MaxAttempts = 5
 	}
@@ -104,6 +126,12 @@ type Config struct {
 	// and must not block.
 	Events func(Event)
 	Timing Timing
+	// NoFallback says whether there is nowhere else to send a flow that the ladder has given up on: the mode of
+	// bypass without a VPN. Asked at the start of each slow Open. Where there is a fallback, the ladder gives up fast and
+	// the caller goes to it; where there is none, giving up only breaks what would have opened without the ladder (a
+	// site slower than the budget), so the open connection is handed over instead (Result.Silent), and a name that
+	// was found down is waited for to the end of the budget, not to T. Nil: there is a fallback.
+	NoFallback func() bool
 
 	// OnSend is for tests: it is called with every connection and the plan about to be sent on it, before the
 	// first byte is written, so that a filter on loopback can be told how the flight is cut. num is the strategy.
@@ -126,6 +154,7 @@ func New(cfg Config) *Flows {
 	f := &Flows{cfg: cfg, tm: cfg.Timing.withDefaults(), mem: cfg.Memory, ladders: map[ladderKey]*ladder{}}
 	if f.mem == nil {
 		f.mem = OpenMemory("", nil)
+		f.mem.SetNetwork("ram") // nobody tells this memory about networks: it has the one
 	}
 	f.sem = make(chan struct{}, f.tm.MaxLadders)
 	return f
@@ -178,6 +207,13 @@ type request struct {
 	ladder  bool           // there is something to try after the first attempt
 	t0, end time.Time      // start and end of the budget
 	step    time.Duration  // T
+	need    time.Duration  // the least time a strategy needs to be answered: 2 round trips of the connect
+	addr    netip.Addr     // where the first connection went; set when the slow path is taken
+}
+
+// canLadder says whether there is something to try after the first connection.
+func (q *request) canLadder() bool {
+	return !q.h.dead && (q.h.first > 1 || q.h.stale > 1 || len(q.cands) > 0)
 }
 
 // Open makes the connection for a TLS flow. name is the host name from hello, which is the whole ClientHello
@@ -189,6 +225,14 @@ type request struct {
 //
 // A flow that is not TLS, or has no name, gets one ordinary connection with hello written, and nothing more.
 // An error is ErrUnreachable, ErrNoWay, or the error of ctx.
+//
+// hello must be the ClientHello and nothing after it: bytes the application sent after it (early data) are sent
+// again on every connection of the ladder, and several of them may reach the server. The caller cuts what it has
+// read at the end of the ClientHello, and holds the rest back with the application's later bytes.
+//
+// Flows to one name wait for each other's ladders. A flow whose ctx ends takes its own ladder with it, and the flows
+// that were waiting for it lead one of their own; they do not fail with it. The callbacks of Config (Events, OnSend)
+// and dial must not panic: a panic on the fast path leaves the connection open.
 func (f *Flows) Open(ctx context.Context, name string, hello []byte, dial DialFunc) (Result, error) {
 	if name == "" || !isClientHello(hello) {
 		return f.direct(ctx, hello, dial)
@@ -206,38 +250,55 @@ func (f *Flows) Open(ctx context.Context, name string, hello []byte, dial DialFu
 		q.cands = set.Site(f.country())
 	}
 	q.nm, q.h = f.mem.plan(q.t)
-	if q.h.unreachable {
-		return Result{}, ErrUnreachable
-	}
 	var ok bool
 	if q.first, ok = resolve(q.h.first, q.cands); !ok {
 		q.first, q.h.first, q.h.src = plain(), 1, srcNone
 	}
-	// With nothing to try after the first connection there is no ladder: it is given the whole budget, so that a
-	// slow site is not cut off. A name that is down is given T only, so that the caller can go elsewhere at once.
-	q.ladder = !q.h.dead && (q.h.first > 1 || q.h.stale > 1 || len(q.cands) > 0)
-
 	q.t0 = time.Now()
 	q.end = q.t0.Add(f.tm.Budget)
-	conn, rtt, err := f.connect(ctx, dial, q.end)
+	// A name whose connection timed out lately is not refused: it is tried, but only for TMax, so that an address that
+	// is still down costs little and one that is not (the network came back, another address of a shared name) is
+	// reached. What is down is the address, and the mark is on the name.
+	dialEnd := q.end
+	if q.h.unreachable && q.t0.Add(f.tm.TMax).Before(dialEnd) {
+		dialEnd = q.t0.Add(f.tm.TMax)
+	}
+	conn, rtt, err := f.connect(ctx, dial, dialEnd)
 	if err != nil {
 		return Result{}, f.unreachable(&q, err)
 	}
+	if q.h.dead && !q.h.deadAt(addrOf(conn)) {
+		q.h.dead = false // the name was found down at another address
+	}
+	// With nothing to try after the first connection there is no ladder: it is given the whole budget, so that a
+	// slow site is not cut off. A name that is down is given T only, so that the caller can go elsewhere at once.
+	q.ladder = q.canLadder()
 	q.step = min(max(2*rtt+f.tm.TSlack, f.tm.TMin), f.tm.TMax)
+	q.need = 2 * rtt
 	wait := q.step
-	if !q.ladder && !q.h.dead {
+	switch {
+	case !q.ladder && (!q.h.dead || f.noFallback()):
 		wait = f.tm.Budget
+	case q.h.slow > 0:
+		wait = max(q.step, min(time.Duration(f.tm.SlowFactor*float64(q.h.slow)), f.tm.SlowMax))
+	}
+	if q.ladder {
+		// Strategy k starts at k*T and needs 2 round trips and the server's time (TSlack) to be answered: the budget is
+		// the time the whole ladder takes on this network, and not less than what was set. On a network where T is
+		// long, a fixed budget would end the ladder before its last strategies could be answered, and the name would
+		// be found down for good.
+		q.end = laterOf(q.end, q.t0.Add(time.Duration(f.tm.MaxAttempts-1)*q.step+q.need+f.tm.TSlack))
 	}
 
 	st := stBroke
 	var first []byte
 	if f.send(conn, q.first, hello) == nil {
-		first, st = readFirst(ctx, conn, q.t0.Add(wait))
+		first, st = readFirst(ctx, conn, q.t0.Add(wait), q.first.Num == 1)
 	}
 	switch st {
 	case stAnswer:
 		conn.SetReadDeadline(time.Time{})
-		f.won(&q, q.first.Num, false)
+		f.won(&q, q.first.Num, false, false)
 		return Result{Conn: conn, First: first, Strategy: q.first.Num}, nil
 	case stCanceled:
 		conn.Close()
@@ -263,6 +324,8 @@ func (f *Flows) direct(ctx context.Context, hello []byte, dial DialFunc) (Result
 	}
 	return Result{Conn: conn, Strategy: 1}, nil
 }
+
+func (f *Flows) noFallback() bool { return f.cfg.NoFallback != nil && f.cfg.NoFallback() }
 
 func (f *Flows) country() string {
 	if f.cfg.Country != nil {
@@ -290,12 +353,39 @@ func (f *Flows) connect(ctx context.Context, dial DialFunc, end time.Time) (*net
 	return c, rtt, err
 }
 
-// unreachable ends an Open whose first connection could not be made.
+func laterOf(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// addrOf is the address a connection goes to; zero when it cannot be told.
+func addrOf(c *net.TCPConn) netip.Addr {
+	if a, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+		if ip, ok := netip.AddrFromSlice(a.IP); ok {
+			return ip.Unmap()
+		}
+	}
+	return netip.Addr{}
+}
+
+// isTimeout says whether a dial failed because nothing answered its SYN before its deadline, as opposed to a refusal,
+// a network that is not there, or a route that is missing: those cost nothing to try again.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// unreachable ends an Open whose first connection could not be made. Only a timeout is remembered (the one failure
+// that costs a whole budget to find out); a refusal or a missing route is as quick the second time.
 func (f *Flows) unreachable(q *request, err error) error {
 	if e := q.ctx.Err(); e != nil {
 		return e
 	}
-	f.mem.record(q.nm, verdict{t: q.t, fail: failUnreachable, pause: f.tm.UnreachFor})
+	if isTimeout(err) {
+		f.mem.record(q.nm, verdict{t: q.t, fail: failUnreachable, pause: f.tm.UnreachFor})
+	}
 	f.emit(q, Event{Kind: EventFailed, Reason: ReasonUnreachable})
 	return ErrUnreachable
 }
@@ -332,9 +422,14 @@ const (
 // goroutine of the caller, which has no other way to be woken; polling costs nothing while the answer is quick.
 const pollCtx = 250 * time.Millisecond
 
-// readFirst waits until end for the first bytes of a TLS answer: a handshake (0x16) or an alert (0x15) record.
-// Anything else is not the server's: a filter that cannot drop a connection can still inject a page or a reset.
-func readFirst(ctx context.Context, c *net.TCPConn, end time.Time) ([]byte, readState) {
+// readFirst waits until end for the first bytes of a TLS answer. Anything that is not one is not the server's: a
+// filter that cannot drop a connection can still inject a page or a reset.
+//
+// On the ordinary connection (plain) a handshake record (0x16) and an alert (0x15) are both answers: an alert is what
+// the server really says to a ClientHello it dislikes, and the application must hear it. On a connection of a
+// strategy only a handshake record is: the strategy has changed the ClientHello, so an alert is what a server or a
+// box on the path says to the damage, and counting it as a win would pin a strategy that opens nothing.
+func readFirst(ctx context.Context, c *net.TCPConn, end time.Time, plain bool) ([]byte, readState) {
 	buf := make([]byte, 5) // a record header: enough to tell TLS, and all the caller gets to write first
 	for {
 		if ctx.Err() != nil {
@@ -347,7 +442,7 @@ func readFirst(ctx context.Context, c *net.TCPConn, end time.Time) ([]byte, read
 		c.SetReadDeadline(dl)
 		n, err := c.Read(buf)
 		if n > 0 {
-			if (buf[0] == 0x16 || buf[0] == 0x15) && (n < 2 || buf[1] == 3) {
+			if (buf[0] == 0x16 || (plain && buf[0] == 0x15)) && (n < 2 || buf[1] == 3) {
 				return buf[:n], stAnswer
 			}
 			return nil, stBroke

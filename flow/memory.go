@@ -6,7 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,7 +24,10 @@ import (
 // What a network teaches the program, and for how long.
 const (
 	fileVersion = 1
-	maxFile     = 1 << 20 // a larger file is damaged, not read
+	// maxFile is the most a file may hold: a larger one is damaged, not read. It is the sum of the limits below (32
+	// networks of 512 parts, 1024 own sites and 128 counts, about 90 KiB each when all are full) with room to spare, so
+	// that a file this package has written is always one it can read.
+	maxFile = 4 << 20
 
 	maxNets   = 32                  // networks kept, the least recently seen go first (plan 4.2)
 	maxAge    = 30 * 24 * time.Hour // a result or a network not seen for this long is forgotten (plan 4.2)
@@ -34,8 +40,10 @@ const (
 	maxStrat  = 9999                // above this a number in the file is not a strategy
 	touchEach = time.Hour           // how often a confirmed result gets a new time (and the file a new write)
 
-	// guardFails is how many times in a row the strategy a record asked for may stay silent before the record is
-	// dropped and the ladder starts over (plan 4.5: three).
+	// guardFails is how many times in a row the strategy a record asked for may stay silent while the ordinary
+	// connection answered before the record is dropped and the ladder starts over (plan 4.5: three). Silence of
+	// everything, the ordinary connection too, is no count: it says the network or the site is down, and nothing about
+	// the strategy (review F1; plan 4.5 said "or nobody").
 	guardFails = 3
 	// harmLimit is how many times a strategy must have lost to plain, where plain worked, before it goes to the end
 	// of the order on that network (plan 5: three).
@@ -50,27 +58,44 @@ const (
 // the user's own sites under a keyed hash of its name, and how many times each strategy has won. No other name is
 // ever written, and nothing is kept for longer than maxAge.
 //
+// What the file gives to whoever can read it (it is only as private as the folder it is in: the caller keeps it where
+// only the service and the administrators can read): which service parts have been used on which networks, and on
+// what days (times are rounded to the day, which is all the aging needs). The key of a network is a fingerprint the
+// caller makes with Salt, which is in the same file, so that whoever has the file can also test a guess of what a
+// network was (a provider, a place) against it; and the same salt keys the hash of an own site, so a list of sites
+// that can be guessed (the popular ones, the blocked ones) can be tested against the file in seconds. The hash
+// keeps the names out of plain sight and out of ready-made tables; it is not a lock. If that matters, the salt
+// belongs where the file is not: the caller can key its fingerprints with a secret of its own, and the file then
+// shows the pattern of use and no more.
+//
 // One mutex guards everything. It is held for map lookups and nothing else: no I/O, no callback, no other lock.
 type Memory struct {
 	path string
 	now  func() time.Time
 
-	mu    sync.Mutex
-	salt  [32]byte
-	nets  map[string]*netMem
-	cur   *netMem
-	dirty bool
+	mu   sync.Mutex
+	salt [32]byte
+	nets map[string]*netMem
+	cur  *netMem
+	// curKey is the key of cur. "" is "the network is not known yet" (see SetNetwork): nothing is learnt then.
+	curKey string
+	dirty  bool
+
+	// unread: the file was there and could not be read, twice. What this run learns is kept in RAM, and the file is
+	// not written: it holds the memory of the earlier runs, and a busy file (a scanner, a backup) is no reason to lose it.
+	unread bool
 
 	saveMu sync.Mutex // one write of the file at a time; taken without mu held
 }
 
 type netMem struct {
-	seen  time.Time
-	wins  map[int]int      // strategy -> times it opened something (disk)
-	parts map[partKey]*rec // service part -> result (disk)
-	sites map[string]*rec  // keyed hash of an own site -> result (disk)
-	names map[string]*rec  // RAM only
-	harms map[int]int      // RAM only: strategy -> times it lost where plain worked
+	seen   time.Time
+	wins   map[int]int      // strategy -> times it opened something in a ladder (disk)
+	winsAt time.Time        // when the wins were last written to the file (RAM)
+	parts  map[partKey]*rec // service part -> result (disk)
+	sites  map[string]*rec  // keyed hash of an own site -> result (disk)
+	names  map[string]*rec  // RAM only
+	harms  map[int]int      // RAM only: strategy -> times it lost where plain worked
 }
 
 // partKey names a part of a service as the set does. The zero value is "no part".
@@ -86,8 +111,11 @@ type rec struct {
 	fails    uint8     // times in a row the strategy that this record asked for stayed silent (RAM)
 	site     string    // key in sites, when this is the record of an own site (RAM)
 
-	deadUntil, unreachUntil time.Time // marks of a name that is down (RAM)
-	used                    time.Time // for choosing what to forget (RAM)
+	deadUntil, unreachUntil time.Time     // marks of a name that is down (RAM)
+	deadAddr                netip.Addr    // the address that was silent: the mark is about it (zero: any)
+	rot                     int           // strategies started by ladders that found nothing: the next one starts after them (RAM)
+	slow                    time.Duration // how long the ordinary connection took when it answered late; 0: it did not (RAM)
+	used                    time.Time     // for choosing what to forget (RAM)
 }
 
 // target is what a connection is for. part is set when the set says the name belongs to a service part; own when
@@ -100,23 +128,32 @@ type target struct {
 
 // OpenMemory reads the memory kept at path. A file that is missing, damaged, too large or of another version is an
 // empty memory: it is never an error, the program starts from nothing and the next Save replaces the file. An
-// empty path keeps everything in RAM. now is the clock; nil means time.Now.
+// empty path keeps everything in RAM. now is the clock; nil means time.Now. The memory starts on no known network
+// (SetNetwork("")): nothing is learnt or used until the caller has said which network this is.
+//
+// A file that is there and cannot be read (another program holds it: a scanner, a backup) is read again a second
+// later; if it still cannot be, the memory starts empty for this run with a salt of its own, and Save does not
+// touch the file, which keeps the memory of the runs before (Save says ErrFileUnread). It is read again at the next
+// start.
 func OpenMemory(path string, now func() time.Time) *Memory {
 	if now == nil {
 		now = time.Now
 	}
 	m := &Memory{path: path, now: now, nets: map[string]*netMem{}}
-	if !m.load() {
+	if st := m.load(); st != loadOK {
 		m.nets = map[string]*netMem{}
 		rand.Read(m.salt[:]) // never fails: crypto/rand crashes the program rather than return an error
 		m.dirty = true
+		m.unread = st == loadUnread
 	}
-	m.cur = m.network("") // also trims a file that holds more networks than maxNets
+	m.trim(nil) // a file that holds more networks than maxNets
+	m.cur = &netMem{seen: m.now()}
 	return m
 }
 
 // Salt is the 32 random bytes of this installation, for the caller to key its network fingerprint with. It is
-// made on first use and kept in the file.
+// made on first use and kept in the file, so a fingerprint made with it hides a network from a reader of the file
+// only as far as the guesses are many (see Memory).
 func (m *Memory) Salt() [32]byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -126,16 +163,47 @@ func (m *Memory) Salt() [32]byte {
 // SetNetwork makes key the current network and says whether it was seen before, in this run or in an earlier one.
 // The key is an opaque short string. What a connection learns is kept under the network it started on: a result
 // that arrives after the network has changed is dropped, not credited to the new one.
+//
+// The caller calls it at every sign that the network may have changed (a new interface, a new address, a wake-up),
+// with the same key when the fingerprint turns out the same: that is also the moment the marks of names that were
+// found down are forgotten, because what made them down may be over (see forgetMarks).
+//
+// The fingerprint takes seconds to make, and the connections made meanwhile are on the new network already. So the
+// caller calls SetNetwork("") at the first sign of a change, and SetNetwork(fingerprint) when it has it: "" is "the
+// network is not known yet", and nothing is learnt under it, in RAM or on disk, and no old result is used for it.
 func (m *Memory) SetNetwork(key string) (known bool) {
 	if len(key) > maxKey {
 		key = key[:maxKey]
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, known = m.nets[key]
-	m.cur = m.network(key)
+	if key != "" {
+		_, known = m.nets[key]
+	}
+	if key == "" {
+		m.cur = &netMem{} // a scratch of its own each time: nothing in it outlives the gap, and it takes no place among the networks
+	} else {
+		m.cur = m.network(key)
+	}
+	m.curKey = key
 	m.cur.seen = m.now()
+	m.cur.forgetMarks()
 	return known
+}
+
+// forgetMarks forgets what was found out about names being down or slow, which holds for a moment and not for a
+// network: the network came back, the interface changed, the machine woke. A name left with no result and no
+// mark is dropped, so that the table of a network that is left does not hold records for nothing.
+func (nm *netMem) forgetMarks() {
+	for k, n := range nm.names {
+		n.deadUntil, n.unreachUntil, n.deadAddr, n.rot, n.slow = time.Time{}, time.Time{}, netip.Addr{}, 0, 0
+		if n.strategy == 0 && n.site == "" {
+			delete(nm.names, k)
+		}
+	}
+	for _, p := range nm.parts {
+		p.slow = 0
+	}
 }
 
 // network finds or makes the record of a network and forgets the least recently seen ones beyond maxNets.
@@ -146,12 +214,19 @@ func (m *Memory) network(key string) *netMem {
 	}
 	nm := &netMem{seen: m.now()}
 	m.nets[key] = nm
+	m.trim(nm)
+	return nm
+}
+
+// trim forgets the least recently seen networks beyond maxNets, but never keep.
+// ponytail: a scan for each one forgotten; the table is 32 long, and a file that holds more is damaged.
+func (m *Memory) trim(keep *netMem) {
 	for len(m.nets) > maxNets {
 		var oldest string
 		var at time.Time
 		found := false
 		for k, o := range m.nets {
-			if o != nm && (!found || o.seen.Before(at)) {
+			if o != keep && (!found || o.seen.Before(at)) {
 				found = true
 				oldest, at = k, o.seen
 			}
@@ -159,7 +234,6 @@ func (m *Memory) network(key string) *netMem {
 		delete(m.nets, oldest)
 		m.dirty = true
 	}
-	return nm
 }
 
 // PartResult is what is known about a service part on the current network.
@@ -197,7 +271,8 @@ func (m *Memory) Site(name string) (strategy int, at time.Time, ok bool) {
 	return 0, time.Time{}, false
 }
 
-// siteKey is the name an own site has on disk: a keyed hash, so that the file shows nothing about the sites.
+// siteKey is the name an own site has on disk: a keyed hash, so that the file does not read as a list of sites. The
+// key is the salt, which is in the file: a name that can be guessed can be checked against it (see Memory).
 func (m *Memory) siteKey(name string) string {
 	h := hmac.New(sha256.New, m.salt[:])
 	h.Write([]byte(strings.ToLower(strings.TrimSuffix(name, "."))))
@@ -210,9 +285,20 @@ type hint struct {
 	stale int // a remembered strategy older than freshFor: it goes right after plain
 	src   source
 
-	dead        bool // the ladder gave up on the name lately: no ladder, plain only
-	unreachable bool // nothing answered at the address lately
-	settled     bool // plain answering would teach nothing new: nothing to write after it
+	dead        bool          // the ladder gave up on the name lately: no ladder, plain only
+	deadAddr    netip.Addr    // ... at this address (zero: at any)
+	unreachable bool          // a connection to the name timed out lately
+	rot         int           // see rec.rot
+	slow        time.Duration // the ordinary connection answered this late lately, with a ladder beside it
+	settled     bool          // plain answering would teach nothing new: nothing to write after it
+}
+
+// deadAt says whether the name is down at the address a connection has just been made to. A name is not an address:
+// the names of a service that stands behind a shared front (the outer name of an encrypted ClientHello is one for
+// thousands of sites) have addresses that are down and addresses that are not, and one silent address must not
+// cut the others off. A mark that does not know its address (a caller that cannot say) holds for the whole name.
+func (h hint) deadAt(a netip.Addr) bool {
+	return h.dead && (!h.deadAddr.IsValid() || !a.IsValid() || h.deadAddr == a)
 }
 
 // source says which record a strategy came from, so that the right one is blamed when it fails.
@@ -251,9 +337,14 @@ func (m *Memory) hint(nm *netMem, t target) (h hint) {
 	if n != nil {
 		n.used = now
 		h.unreachable = now.Before(n.unreachUntil)
-		h.dead = now.Before(n.deadUntil)
+		h.dead, h.deadAddr, h.rot = now.Before(n.deadUntil), n.deadAddr, n.rot
+		h.slow = n.slow
 		marked = !n.deadUntil.IsZero() || !n.unreachUntil.IsZero()
 	}
+	if p := nm.parts[t.part]; p != nil && t.part.ok() && p.slow > h.slow {
+		h.slow = p.slow
+	}
+	marked = marked || h.slow > 0
 	r, src := n, srcName
 	if r == nil || r.strategy == 0 {
 		r, src = nm.parts[t.part], srcPart
@@ -353,8 +444,20 @@ type verdict struct {
 	first  int    // the strategy the connection started with
 	src    source // the record that asked for it
 	winner int    // the strategy that opened it; 0: none did
-	fail   failKind
-	pause  time.Duration // how long to leave a name that is down alone
+	ladder bool   // it was opened in a ladder: the first connection was not answered in time
+	// follower: the connection waited for a ladder that another connection led. Its answer is a fact about the name,
+	// but not a new observation against the strategy that was asked for: that one belongs to the leader, so that a
+	// burst of connections to one name is one observation and not many (guardFails counts observations).
+	follower bool
+	fail     failKind
+	pause    time.Duration // how long to leave a name that is down alone
+	addr     netip.Addr    // the address the ladder found silent
+	launched int           // the strategies it started after the first connection
+
+	// For an answer of the ordinary connection: how long it took if later than T (slow), and whether that is known
+	// at all (slowSet): an answer in time clears what an earlier slow one wrote.
+	slow    time.Duration
+	slowSet bool
 }
 
 // change is what recording a verdict did that the caller may want to tell.
@@ -367,7 +470,7 @@ type change struct {
 func (m *Memory) record(nm *netMem, v verdict) (ch change) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if nm != m.cur {
+	if nm != m.cur || m.curKey == "" {
 		return
 	}
 	now := m.now()
@@ -377,27 +480,41 @@ func (m *Memory) record(nm *netMem, v verdict) (ch change) {
 	case v.fail == failUnreachable:
 		m.nameRec(nm, v.t).unreachUntil = now.Add(v.pause)
 	default:
-		m.nameRec(nm, v.t).deadUntil = now.Add(v.pause)
-		if v.first > 1 {
-			ch.broken = m.lose(nm, v)
-		}
+		n := m.nameRec(nm, v.t)
+		n.deadUntil, n.deadAddr = now.Add(v.pause), v.addr
+		n.rot += v.launched
 	}
 	return
 }
 
+// countWin counts a win of a strategy in a ladder. Only a ladder counts: a connection that went straight to a
+// remembered strategy proves nothing the ladder has not shown, and counting it would write the file on every
+// connection and let a strategy that has stopped working lead the order for strangers for ever. The count is in RAM at
+// once; the file hears of it when the strategy is new to the network, and then once per touchEach.
+func (m *Memory) countWin(nm *netMem, w int, now time.Time) {
+	if nm.wins[w] == 0 && len(nm.wins) >= maxWins {
+		return // the table is full: strategies already in it keep counting
+	}
+	first := nm.wins[w] == 0
+	nm.wins = bump(nm.wins, w)
+	if first || now.Sub(nm.winsAt) > touchEach {
+		nm.winsAt = now
+		m.dirty = true
+	}
+}
+
 func (m *Memory) win(nm *netMem, v verdict, now time.Time) (ch change) {
 	t, w := v.t, v.winner
-	if w > 1 {
-		nm.wins = bump(nm.wins, w)
-		m.dirty = true
+	if w > 1 && v.ladder {
+		m.countWin(nm, w, now)
 	}
 	n := nm.names[t.name]
 	if n != nil {
-		n.deadUntil, n.unreachUntil = time.Time{}, time.Time{}
+		n.deadUntil, n.unreachUntil, n.deadAddr, n.rot = time.Time{}, time.Time{}, netip.Addr{}, 0
 	}
 	// Plain answered where the strategy the memory asked for had stayed silent: the strategy does harm here.
 	harm := w == 1 && v.first > 1
-	if harm {
+	if harm && !v.follower {
 		nm.harms = bump(nm.harms, v.first)
 	}
 	switch {
@@ -415,7 +532,7 @@ func (m *Memory) win(nm *netMem, v verdict, now time.Time) (ch change) {
 		// The part needs a strategy, this name does not: the name is remembered as it is, the part is blamed.
 		n = m.nameRec(nm, t)
 		n.strategy, n.at, n.fails = 1, now, 0
-		if v.src == srcPart {
+		if v.src == srcPart && !v.follower {
 			ch.broken = m.lose(nm, v)
 		}
 	default:
@@ -424,6 +541,27 @@ func (m *Memory) win(nm *netMem, v verdict, now time.Time) (ch change) {
 		}
 		if p := nm.parts[t.part]; p == nil || p.strategy <= 1 || now.Sub(p.at) > freshFor {
 			ch.changed = m.setPart(nm, t.part, 1, now)
+		}
+	}
+	if v.slowSet {
+		// The ordinary connection answered: a name (and its part) that answers late is remembered as slow, and one that
+		// answers in time is not any more. Not written to disk: how loaded a network is does not outlive the run.
+		p := nm.parts[t.part]
+		if !t.part.ok() {
+			p = nil
+		}
+		if v.slow > 0 {
+			m.nameRec(nm, t).slow = v.slow
+			if p != nil {
+				p.slow = v.slow
+			}
+		} else {
+			if n := nm.names[t.name]; n != nil {
+				n.slow = 0
+			}
+			if p != nil {
+				p.slow = 0
+			}
 		}
 	}
 	return
@@ -530,29 +668,59 @@ type diskRec struct {
 	At int64  `json:"at"`
 }
 
-// load reads the file into m, and reports whether it was usable (a salt that was there, a version that is known).
-func (m *Memory) load() bool {
-	if m.path == "" {
-		return false
-	}
-	f, err := os.Open(m.path)
+type loadState uint8
+
+const (
+	loadEmpty  loadState = iota // no file, or one that is not plausible: start from nothing and replace it
+	loadOK                      // the file was read
+	loadUnread                  // the file is there and cannot be read: start from nothing and leave it alone
+)
+
+// readFile reads the file, as far as maxFile and one byte more. A variable, and rereadAfter with it, so that a test
+// can make the file busy (on Windows a scanner does it, on any system a permission does).
+var (
+	readFile    = readCapped
+	rereadAfter = time.Second
+)
+
+func readCapped(path string) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return nil, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxFile+1))
+	return io.ReadAll(io.LimitReader(f, maxFile+1))
+}
+
+// load reads the file into m, and says what became of it: usable (a salt that was there, a version that is known),
+// not there or not plausible, or there and busy.
+func (m *Memory) load() loadState {
+	if m.path == "" {
+		return loadEmpty
+	}
+	data, err := readFile(m.path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		time.Sleep(rereadAfter)
+		data, err = readFile(m.path)
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return loadEmpty
+	}
+	if err != nil {
+		return loadUnread
+	}
 	var d diskFile
-	if err != nil || len(data) > maxFile || json.Unmarshal(data, &d) != nil || d.V != fileVersion {
-		return false
+	if len(data) > maxFile || json.Unmarshal(data, &d) != nil || d.V != fileVersion {
+		return loadEmpty
 	}
 	salt, err := hex.DecodeString(d.Salt)
 	if err != nil || len(salt) != len(m.salt) {
-		return false
+		return loadEmpty
 	}
 	copy(m.salt[:], salt)
 	now := m.now()
 	for key, dn := range d.Networks {
-		if dn == nil || len(key) > maxKey || len(dn.Parts) > maxParts || len(dn.Sites) > maxSites || len(dn.Wins) > maxWins {
+		if dn == nil || key == "" || len(key) > maxKey || len(dn.Parts) > maxParts || len(dn.Sites) > maxSites || len(dn.Wins) > maxWins {
 			continue
 		}
 		seen := time.Unix(dn.Seen, 0)
@@ -589,7 +757,7 @@ func (m *Memory) load() bool {
 		}
 		m.nets[key] = nm
 	}
-	return true
+	return loadOK
 }
 
 // fromDisk turns a record of the file into one in RAM, or nil if it is not plausible or has aged out.
@@ -615,8 +783,16 @@ func isHex(s string) bool {
 	return err == nil
 }
 
+// ErrFileUnread is what Save says when the file could not be read at the start of the run and is therefore left as
+// it is: nothing is lost, only this run's results are not kept. Worth a line in a log, once.
+var ErrFileUnread = errors.New("flow: the memory file could not be read at start and is not overwritten")
+
 // Save writes the memory to its file if anything worth keeping has changed since the last write. The write is
 // atomic: the file is whole before and after it. Call it from time to time and when the program stops.
+//
+// It writes only what has changed: a result that is new or different, a strategy that won its first ladder on a
+// network, and the rest (a result confirmed again, wins counted again) at most once per touchEach. A timer of
+// a minute or so is therefore enough, and no connection makes a write of its own.
 func (m *Memory) Save() error {
 	if m.path == "" {
 		return nil
@@ -627,6 +803,10 @@ func (m *Memory) Save() error {
 	if !m.dirty {
 		m.mu.Unlock()
 		return nil
+	}
+	if m.unread {
+		m.mu.Unlock()
+		return ErrFileUnread
 	}
 	data, err := m.encode()
 	m.dirty = false
@@ -647,7 +827,16 @@ func (m *Memory) encode() ([]byte, error) {
 	now := m.now()
 	d := diskFile{V: fileVersion, Salt: hex.EncodeToString(m.salt[:]), Networks: map[string]*diskNet{}}
 	for key, nm := range m.nets {
-		dn := &diskNet{Seen: nm.seen.Unix(), Wins: map[string]int{}, Parts: map[string]diskRec{}, Sites: map[string]diskRec{}}
+		if key == "" {
+			continue // the network that is not known is never written
+		}
+		// The network in use is seen now, whenever SetNetwork was last called: a service that stays on one network for
+		// a month has not forgotten it.
+		seen := nm.seen
+		if nm == m.cur {
+			seen = now
+		}
+		dn := &diskNet{Seen: day(seen), Wins: map[string]int{}, Parts: map[string]diskRec{}, Sites: map[string]diskRec{}}
 		for s, c := range nm.wins {
 			dn.Wins[strconv.Itoa(s)] = c
 		}
@@ -661,7 +850,7 @@ func (m *Memory) encode() ([]byte, error) {
 				dn.Sites[k] = dr
 			}
 		}
-		if len(dn.Wins)+len(dn.Parts)+len(dn.Sites) > 0 && now.Sub(nm.seen) <= maxAge {
+		if len(dn.Wins)+len(dn.Parts)+len(dn.Sites) > 0 && now.Sub(seen) <= maxAge {
 			d.Networks[key] = dn
 		}
 	}
@@ -673,10 +862,14 @@ func toDisk(r *rec, now time.Time) (diskRec, bool) {
 		return diskRec{}, false
 	}
 	if r.strategy == 1 {
-		return diskRec{O: "self", At: r.at.Unix()}, true
+		return diskRec{O: "self", At: day(r.at)}, true
 	}
-	return diskRec{O: "bypass", S: r.strategy, At: r.at.Unix()}, true
+	return diskRec{O: "bypass", S: r.strategy, At: day(r.at)}, true
 }
+
+// day is a time as the file holds it: the start of its day (UTC). Aging works in days, and the exact time of a result
+// or of a visit to a network says more about the person than anything the memory needs.
+func day(t time.Time) int64 { return t.Truncate(24 * time.Hour).Unix() }
 
 // writeAtomic replaces the file at path with data: the bytes go to a file beside it, are flushed, and the new file
 // is renamed over the old one, so that a crash leaves one or the other whole.

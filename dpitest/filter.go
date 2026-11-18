@@ -13,6 +13,7 @@ package dpitest
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -192,7 +193,7 @@ type Filter struct {
 // New starts a filter in front of the server at upstream. It stops with the test.
 func New(t testing.TB, upstream string, pred Predicate, act Action) *Filter {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := listen()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +215,14 @@ func New(t testing.TB, upstream string, pred Predicate, act Action) *Filter {
 		}
 	})
 	return f
+}
+
+// listen opens the listening socket of a filter. The urgent byte is read as the payload it is on the wire, so that
+// what arrives can be checked against the plan; the option is set here, on the listener, because a connection that
+// is given it only after it has been accepted may be given it too late (see urgentInline).
+func listen() (net.Listener, error) {
+	lc := net.ListenConfig{Control: urgentInline}
+	return lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 }
 
 // Addr is where clients connect.
@@ -270,16 +279,6 @@ func (f *Filter) accept() {
 
 func (f *Filter) handle(c net.Conn) {
 	c.SetDeadline(time.Now().Add(30 * time.Second))
-	// The urgent byte is read as the payload it is on the wire, so that what arrives can be checked against the plan.
-	if err := urgentInline(c.(*net.TCPConn)); err != nil {
-		// A client that has already gone, as one that lost a race does, leaves no socket to set the option on.
-		c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		if _, rerr := io.Copy(io.Discard, c); rerr == nil || !errors.Is(rerr, os.ErrDeadlineExceeded) {
-			return // closed or reset: nothing to check
-		}
-		f.fail("urgent data: %v", err)
-		return
-	}
 	flight, e, err := f.readFlight(c)
 	if err != nil {
 		return // the client went away before it said anything

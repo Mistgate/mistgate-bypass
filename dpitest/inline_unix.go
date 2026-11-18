@@ -2,19 +2,14 @@
 
 package dpitest
 
-import (
-	"net"
-	"syscall"
-)
+import "syscall"
 
-// urgentInline makes the socket deliver urgent data in the stream, where it sits on the wire.
-func urgentInline(c *net.TCPConn) error {
-	rc, err := c.SyscallConn()
-	if err != nil {
-		return err
-	}
+// urgentInline makes a socket deliver urgent data in the stream, where it sits on the wire. It is for the listening
+// socket, before it is bound: accepted sockets inherit it, so no connection is ever without it, however soon its
+// client writes.
+func urgentInline(_, _ string, c syscall.RawConn) error {
 	var ferr error
-	if err := rc.Control(func(fd uintptr) { ferr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_OOBINLINE, 1) }); err != nil {
+	if err := c.Control(func(fd uintptr) { ferr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_OOBINLINE, 1) }); err != nil {
 		return err
 	}
 	return ferr
