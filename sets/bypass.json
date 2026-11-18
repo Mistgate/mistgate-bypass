@@ -1,0 +1,44 @@
+{
+  "v": 1,
+  "seq": 1,
+  "date_unix": 1794960000,
+  "countries": {
+    "ru": { "quick": [6, 16, 8, 15, 2, 18, 20], "quic_off": ["yt"] },
+    "tr": { "quick": [6, 7, 16, 14, 11, 12, 13, 10, 9], "quic_off": [] },
+    "*":  { "quick": [6, 16, 15, 7, 2, 8, 14, 11], "quic_off": ["yt"] }
+  },
+  "categories": ["popular", "social"],
+  "services": [
+    { "id": "yt", "name": "YouTube", "icon": "media-video", "categories": ["popular", "social"],
+      "parts": [
+        { "id": "site", "kind": "tls",
+          "domains": ["youtube.com", "youtu.be", "ytimg.com", "ggpht.com", "youtube-nocookie.com"],
+          "checks": ["https://www.youtube.com/", "https://i.ytimg.com/generate_204"] },
+        { "id": "video", "kind": "tls", "domains": ["googlevideo.com"],
+          "checks": ["https://redirector.googlevideo.com/report_mapping"] },
+        { "id": "api", "kind": "tls", "hidden": true, "domains": ["youtubei.googleapis.com"],
+          "checks": ["https://youtubei.googleapis.com/"],
+          "quick": { "ru": [16, 18, 20] } },
+        { "id": "quic", "kind": "quic-off", "domains": ["youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com"] }
+      ] },
+    { "id": "dc", "name": "Discord", "icon": "headset", "categories": ["popular", "social"],
+      "parts": [
+        { "id": "chat", "kind": "tls",
+          "domains": ["discord.com", "discord.gg", "discordapp.com", "discordapp.net", "discord.media", "discordcdn.com"],
+          "checks": ["https://discord.com/", "https://gateway.discord.gg/", "https://cdn.discordapp.com/"] },
+        { "id": "voice", "kind": "voice" }
+      ] },
+    { "id": "tg", "name": "Telegram", "icon": "send-diagonal", "categories": ["popular", "social"],
+      "parts": [ { "id": "messages", "kind": "telegram" }, { "id": "calls", "kind": "telegram" } ] },
+    { "id": "wa", "name": "WhatsApp", "icon": "chat-bubble", "categories": ["popular", "social"],
+      "parts": [ { "id": "service", "kind": "app" } ] },
+    { "id": "ig", "name": "Instagram", "icon": "camera", "categories": ["popular", "social"],
+      "parts": [ { "id": "service", "kind": "tls", "quick": { "*": [] } } ] },
+    { "id": "fb", "name": "Facebook", "icon": "community", "categories": ["popular", "social"],
+      "parts": [ { "id": "service", "kind": "tls", "quick": { "*": [] } } ] }
+  ],
+  "controls": {
+    "ru": ["https://ya.ru/"],
+    "*": ["https://www.wikipedia.org/", "https://www.microsoft.com/"]
+  }
+}

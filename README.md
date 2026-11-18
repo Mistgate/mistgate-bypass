@@ -9,6 +9,8 @@ a remote server, and a probe that measures which of them work on a given network
 - `dpitest/` — a stand-in for the filter of a network, for tests: a TCP proxy on loopback that drops a connection when its
   first flight matches a predicate (the name whole in one segment, or in one TLS record, or in the first two segments,
   a block on the address), so that a test can ask which strategies get through. Standard library only.
+- `sets/` — the set of strategies as a signed file: which strategies to try for which service in which country, the
+  catalogue of services, the match of a host name to a service, and the set built into the library.
 - `cmd/mgprobe/` — the probe: one Windows program, no installation and no administrator rights. It makes outgoing
   connections only, changes nothing on the machine and writes `mgprobe-report.txt` beside itself. The report carries no
   computer or user name, no local or public address of the user, no adapter or Wi-Fi names.
