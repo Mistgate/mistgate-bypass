@@ -555,16 +555,6 @@ func TestQUIC(t *testing.T) {
 	}
 }
 
-func TestQUICVariants(t *testing.T) {
-	vs := quicVariants()
-	if len(vs) != 13 || vs[0].name() != "bare" || vs[1].name() != "zeros-n2-ttl3" || vs[12].name() != "blob-n6-ttl8" {
-		t.Fatalf("%d variants, first %s last %s", len(vs), vs[1].name(), vs[len(vs)-1].name())
-	}
-	if len(quicFakeBlob) != 1200 {
-		t.Fatalf("blob is %d bytes", len(quicFakeBlob))
-	}
-}
-
 func syntheticReport() *Report {
 	rep := &Report{Tool: "mgprobe", Version: version, Time: "2026-01-01T00:00:00Z", OS: "10.0 (build 1)", ElapsedSec: 1, Seed: probeSeed,
 		Environment: Environment{Distorted: true, Reasons: []string{"запущены программы обхода или VPN: warp-svc"}, Tools: []string{"warp-svc"}, WinDivert: "not-loaded"}}

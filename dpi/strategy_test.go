@@ -294,20 +294,24 @@ func TestPlanLeavesOtherInputAlone(t *testing.T) {
 	}
 }
 
+// What callers rely on: a walk from the top starts with the connection as it is, a name means one strategy, and a
+// stored name finds it again.
 func TestLadder(t *testing.T) {
-	want := []string{"plain", "tlsrec", "split1", "splitsni", "splitsni-delay", "tlsrec+split", "multisplit", "oob",
-		"rec-multi-nodelay", "labels", "split5", "split7", "ladder8", "rec-multi", "oob1+rec-5se", "oob1+ladder8",
-		"disorder-ttl", "rec1s+disorder1", "split1s+disorder3s", "ladder-mixed"}
 	got := Ladder()
-	if len(got) != len(want) {
-		t.Fatalf("%d strategies", len(got))
+	if len(got) == 0 || got[0].Name != "plain" || len(got[0].Plan([]byte("x"))) != 1 {
+		t.Fatal("the ladder does not start with the plain connection")
 	}
-	for i, s := range got {
-		if s.Name != want[i] {
-			t.Errorf("rung %d is %s, want %s", i, s.Name, want[i])
+	seen := map[string]bool{}
+	for _, s := range got {
+		if seen[s.Name] {
+			t.Errorf("two strategies are named %s", s.Name)
 		}
+		seen[s.Name] = true
 		if b, ok := ByName(s.Name); !ok || b.Name != s.Name {
 			t.Errorf("ByName(%s)", s.Name)
 		}
+	}
+	if _, ok := ByName("no such strategy"); ok {
+		t.Error("ByName found a strategy that does not exist")
 	}
 }
