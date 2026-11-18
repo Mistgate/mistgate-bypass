@@ -149,3 +149,75 @@ func TestUnannouncedClient(t *testing.T) {
 		t.Errorf("reset: %v", err)
 	}
 }
+
+// A client that sends its flight itself announces the plan with Announce: the filter checks the bytes against it,
+// counts the connection while it holds it, and holds the server's reply back when told to, as a slow site does.
+func TestAnnounceCountsAndDelay(t *testing.T) {
+	upstream := server(t)
+	f := New(t, upstream, Never, Silence)
+	f.SetDelay(150 * time.Millisecond)
+	c, err := net.Dial("tcp", f.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// A ClientHello, cut in two as a strategy would, announced before it is written.
+	pipe, far := net.Pipe() // the client under test reads and writes here, never on the connection that is announced
+	defer pipe.Close()
+	defer far.Close()
+	go io.Copy(io.Discard, far)
+	rec := &capture{Conn: pipe}
+	cc := tls.Client(rec, &tls.Config{ServerName: allowed, InsecureSkipVerify: true})
+	go cc.Handshake() // writes the ClientHello into capture, which holds it back
+	waitFor(t, func() bool { return len(rec.first()) > 0 })
+	hello := rec.first()
+	plan := dpi.Plan{{Data: hello[:100]}, {Data: hello[100:]}}
+	f.Announce(c.LocalAddr(), plan)
+	start := time.Now()
+	for _, ch := range plan {
+		if _, err := c.Write(ch.Data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != nil || time.Since(start) < 150*time.Millisecond {
+		t.Errorf("the reply came after %v: %v", time.Since(start), err)
+	}
+	if f.Accepted() != 1 || f.Active() != 1 {
+		t.Errorf("%d accepted, %d active", f.Accepted(), f.Active())
+	}
+	c.Close()
+	waitFor(t, func() bool { return f.Active() == 0 })
+}
+
+// capture keeps the first write of a client and does not send it.
+type capture struct {
+	net.Conn
+	mu  sync.Mutex
+	got []byte
+}
+
+func (c *capture) first() []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.got
+}
+
+func (c *capture) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.got) == 0 {
+		c.got = append([]byte(nil), b...)
+		return len(b), nil
+	}
+	return c.Conn.Write(b)
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	for end := time.Now().Add(3 * time.Second); !ok(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatal("timed out")
+		}
+	}
+}

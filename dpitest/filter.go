@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -176,6 +177,11 @@ type Filter struct {
 	pred     Predicate
 	act      Action
 
+	accepted atomic.Int64 // connections the filter has taken
+	active   atomic.Int64 // of those, the ones it still serves
+	delay    atomic.Int64 // nanoseconds the server's first reply is held back
+	stop     chan struct{}
+
 	mu      sync.Mutex
 	flights map[string]*announced // by the client's address
 	conns   map[net.Conn]struct{}
@@ -190,10 +196,12 @@ func New(t testing.TB, upstream string, pred Predicate, act Action) *Filter {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &Filter{ln: ln, upstream: upstream, pred: pred, act: act, flights: map[string]*announced{}, conns: map[net.Conn]struct{}{}}
+	f := &Filter{ln: ln, upstream: upstream, pred: pred, act: act, stop: make(chan struct{}),
+		flights: map[string]*announced{}, conns: map[net.Conn]struct{}{}}
 	f.wg.Add(1)
 	go f.accept()
 	t.Cleanup(func() {
+		close(f.stop)
 		ln.Close()
 		f.mu.Lock()
 		for c := range f.conns {
@@ -211,6 +219,27 @@ func New(t testing.TB, upstream string, pred Predicate, act Action) *Filter {
 // Addr is where clients connect.
 func (f *Filter) Addr() string { return f.ln.Addr().String() }
 
+// Accepted is how many connections the filter has taken since it started.
+func (f *Filter) Accepted() int { return int(f.accepted.Load()) }
+
+// Active is how many of them it still holds open: a client that has closed its end is gone from the count once the
+// filter has noticed, so a test of cancellation can wait for it to reach zero.
+func (f *Filter) Active() int { return int(f.active.Load()) }
+
+// SetDelay holds back the first reply of the server for d, as a slow site does. It applies to the connections that
+// are let through, from the next one on.
+func (f *Filter) SetDelay(d time.Duration) { f.delay.Store(int64(d)) }
+
+// Announce tells the filter how the client that has just connected from local is about to send its first flight,
+// for a client that sends it with dpi.Execute instead of through Try. It must be called before the first byte is
+// written; the filter then reads and checks the bytes as it does for Try.
+func (f *Filter) Announce(local net.Addr, p dpi.Plan) {
+	e := &announced{flight: flightOf(p), verdict: make(chan Action, 1)}
+	f.mu.Lock()
+	f.flights[local.String()] = e
+	f.mu.Unlock()
+}
+
 func (f *Filter) fail(format string, a ...any) {
 	f.mu.Lock()
 	f.errs = append(f.errs, "dpitest: "+fmt.Sprintf(format, a...))
@@ -227,9 +256,12 @@ func (f *Filter) accept() {
 		f.mu.Lock()
 		f.conns[c] = struct{}{}
 		f.mu.Unlock()
+		f.accepted.Add(1)
+		f.active.Add(1)
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
+			defer f.active.Add(-1)
 			defer c.Close()
 			f.handle(c)
 		}()
@@ -240,6 +272,11 @@ func (f *Filter) handle(c net.Conn) {
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	// The urgent byte is read as the payload it is on the wire, so that what arrives can be checked against the plan.
 	if err := urgentInline(c.(*net.TCPConn)); err != nil {
+		// A client that has already gone, as one that lost a race does, leaves no socket to set the option on.
+		c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, rerr := io.Copy(io.Discard, c); rerr == nil || !errors.Is(rerr, os.ErrDeadlineExceeded) {
+			return // closed or reset: nothing to check
+		}
 		f.fail("urgent data: %v", err)
 		return
 	}
@@ -259,6 +296,13 @@ func (f *Filter) handle(c net.Conn) {
 			return
 		}
 		go func() { io.Copy(up, c); up.Close() }()
+		if d := time.Duration(f.delay.Load()); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-f.stop:
+				return
+			}
+		}
 		io.Copy(c, up)
 		return
 	}
@@ -279,8 +323,10 @@ func (f *Filter) readFlight(c net.Conn) (Flight, *announced, error) {
 	if err := readFull(c, first); err != nil {
 		return Flight{}, nil, err
 	}
+	// The announcement is for this connection only: a later one that gets the same port must not inherit it.
 	f.mu.Lock()
 	e := f.flights[c.RemoteAddr().String()]
+	delete(f.flights, c.RemoteAddr().String())
 	f.mu.Unlock()
 	if e != nil {
 		want := e.flight.stream(Inline)
@@ -421,21 +467,28 @@ type announcer struct {
 func (a *announcer) Write(b []byte) (int, error) {
 	if !a.done {
 		a.done = true
-		for _, c := range a.s.Plan(b) {
-			data := bytes.Clone(c.Data) // crypto/tls reuses its buffer once the write returns
-			if c.OOB {
-				a.e.flight.Segments = append(a.e.flight.Segments, Segment{Data: data, Urgent: true})
-				continue
-			}
-			for d := data; len(d) > 0; {
-				n := min(len(d), mss)
-				a.e.flight.Segments = append(a.e.flight.Segments, Segment{Data: d[:n]})
-				d = d[n:]
-			}
-		}
+		a.e.flight = flightOf(a.s.Plan(b))
 		a.f.mu.Lock()
 		a.f.flights[a.key] = a.e
 		a.f.mu.Unlock()
 	}
 	return a.Conn.Write(b)
+}
+
+// flightOf is how a path carries the writes of a plan: a write longer than a segment goes as several.
+func flightOf(p dpi.Plan) Flight {
+	var fl Flight
+	for _, c := range p {
+		data := bytes.Clone(c.Data) // crypto/tls reuses its buffer once the write returns
+		if c.OOB {
+			fl.Segments = append(fl.Segments, Segment{Data: data, Urgent: true})
+			continue
+		}
+		for d := data; len(d) > 0; {
+			n := min(len(d), mss)
+			fl.Segments = append(fl.Segments, Segment{Data: d[:n]})
+			d = d[n:]
+		}
+	}
+	return fl
 }
