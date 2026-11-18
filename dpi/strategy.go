@@ -3,6 +3,7 @@ package dpi
 import (
 	"hash/fnv"
 	"math/rand"
+	"slices"
 	"time"
 )
 
@@ -19,26 +20,39 @@ type Plan []Chunk
 
 // Strategy is a named way of cutting the first write of a connection.
 type Strategy struct {
+	Num          int // permanent number: the column of the strategy in every report; never reused
 	Name         string
 	Experimental bool // depends on how the path handles a low-TTL segment; may do nothing or stall
 	seed         int64
-	build        func(hello []byte, h Hello, rnd *rand.Rand) Plan
+	spec         Spec
 }
 
 const (
-	splitPause = 100 * time.Millisecond
-	oobByte    = 'a' // never reaches the application on a peer that keeps urgent data out of the stream
+	oobByte = 'a' // never reaches the application on a peer that keeps urgent data out of the stream
 
 	// DefaultSeed is the seed Ladder uses for the strategies that draw random cut points.
 	DefaultSeed = 1
 )
+
+// NewStrategy builds a strategy from the text form of a Spec. The random cut points of the spec depend only on
+// seed and the server name.
+func NewStrategy(num int, name, spec string, seed int64) (Strategy, error) {
+	sp, err := ParseSpec(spec)
+	if err != nil {
+		return Strategy{}, err
+	}
+	return Strategy{Num: num, Name: name, Experimental: sp.Experimental(), seed: seed, spec: sp}, nil
+}
+
+// Spec is the description the strategy was built from.
+func (s Strategy) Spec() Spec { return s.spec }
 
 // Plan turns the bytes of a first write (a TLS ClientHello) into the writes to make. Input that is not a
 // ClientHello with its name inside the first record is sent as it is: a strategy cannot cut what it cannot find.
 // Random choices depend only on the strategy's seed and the server name, so one name always gets the same cuts.
 func (s Strategy) Plan(hello []byte) Plan {
 	plain := Plan{{Data: hello}}
-	if s.build == nil {
+	if len(s.spec) == 0 {
 		return plain
 	}
 	h, err := ParseClientHello(hello)
@@ -47,7 +61,40 @@ func (s Strategy) Plan(hello []byte) Plan {
 	}
 	f := fnv.New64a()
 	f.Write([]byte(h.ServerName))
-	return s.build(hello, h, rand.New(rand.NewSource(s.seed^int64(f.Sum64()))))
+	return s.spec.plan(hello, h, rand.New(rand.NewSource(s.seed^int64(f.Sum64()))))
+}
+
+// The strategies from the cheapest to the most intrusive; a strategy's number is its place here, from 1.
+// Never reorder or insert: the numbers are what the reports already collected call the strategies.
+// The ones with TTL 1 lose some pieces on the way and TCP sends them again after the pieces that follow, so the
+// path sees the pieces swapped; a loopback or a one-hop path does not drop them.
+var ladder = []struct{ name, spec string }{
+	{"plain", ""},
+	{"tlsrec", "rec:m"},
+	{"split1", "cut:1"},
+	{"splitsni", "cut:m"},
+	{"splitsni-delay", "cut:m; delay:100"},
+	{"tlsrec+split", "rec:m; cut:s"},
+	{"multisplit", "cut:1,m"},
+	{"oob", "cut:m; oob:0"},
+	// Records cut at random places from the start of the handshake, as a record-fragmenting proxy does.
+	{"rec-multi-nodelay", "recmulti:0"},
+	// One TCP cut inside every label of the name, with a short pause between the pieces.
+	{"labels", "labels:30"},
+	// Equal pieces over the name and two bytes around it: two pieces are not enough for some middleboxes.
+	{"split5", "eq:5"},
+	{"split7", "eq:7"},
+	{"ladder8", "cut:s+1,s+3,s+6,s+9,s+12,s+15,s+20,s+30"},
+	{"rec-multi", "recmulti:pause"},
+	{"oob1+rec-5se", "rec:se-5; cut:1; oob:0"},
+	{"oob1+ladder8", "cut:1,s+1,s+3,s+6,s+9,s+12,s+15,s+20,s+30; oob:0"},
+	{"disorder-ttl", "cut:m; ttl1:0"},
+	// Record cut at s+1; the first byte of the stream is the one that gets lost.
+	{"rec1s+disorder1", "rec:s+1; cut:1; ttl1:0"},
+	// The piece from s+1 to s+3 is the lost one, so the retransmission carries on from there.
+	{"split1s+disorder3s", "cut:s+1,s+3; ttl1:1"},
+	// Record cut at s+1 and ten cuts after it, every second piece lost on the way.
+	{"ladder-mixed", "rec:s+1; cut:1,s+3,s+6,s+9,s+12,s+15,s+20,s+25,s+30,s+35; ttl1:1,3,5,7,9"},
 }
 
 // Ladder lists the strategies from the cheapest to the most intrusive, with DefaultSeed; a caller that needs one
@@ -55,97 +102,15 @@ func (s Strategy) Plan(hello []byte) Plan {
 func Ladder() []Strategy { return LadderSeed(DefaultSeed) }
 
 // LadderSeed is Ladder with the seed for the random cut points chosen by the caller.
-// In the comments s is the first byte of the host name, se the byte after its last one, and "x+n" an offset from it.
+// In the specs s is the first byte of the host name, se the byte after its last one, and "x+n" an offset from it.
 func LadderSeed(seed int64) []Strategy {
-	l := []Strategy{
-		{Name: "plain"},
-		{Name: "tlsrec", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return Plan{{Data: splitRecord(b, h)}} }},
-		{Name: "split1", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, 1) }},
-		{Name: "splitsni", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, h.MidSLD) }},
-		{Name: "splitsni-delay", build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			p := cut(b, h.MidSLD)
-			p[len(p)-1].Delay = splitPause
-			return p
-		}},
-		{Name: "tlsrec+split", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(splitRecord(b, h), h.HostStart) }},
-		{Name: "multisplit", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, 1, h.MidSLD) }},
-		{Name: "oob", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return oobAfter(cut(b, h.MidSLD), 0) }},
-
-		// Records cut at random places from the start of the handshake, as a record-fragmenting proxy does.
-		{Name: "rec-multi-nodelay", build: func(b []byte, h Hello, r *rand.Rand) Plan {
-			var all []byte
-			for _, c := range recMulti(b, h, r, false) {
-				all = append(all, c.Data...)
-			}
-			return Plan{{Data: all}}
-		}},
-		// One TCP cut inside every label of the name, with a short pause between the pieces.
-		{Name: "labels", build: func(b []byte, h Hello, r *rand.Rand) Plan {
-			var at []int
-			for p := h.HostStart; p < h.HostEnd; {
-				end := p
-				for end < h.HostEnd && b[end] != '.' {
-					end++
-				}
-				if end-p > 1 {
-					at = append(at, p+1+r.Intn(end-p-1))
-				}
-				p = end + 1
-			}
-			return delayed(cut(b, at...), 30*time.Millisecond)
-		}},
-		// Equal pieces over the name and two bytes around it: two pieces are not enough for some middleboxes.
-		{Name: "split5", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, equalCuts(h, 5)...) }},
-		{Name: "split7", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, equalCuts(h, 7)...) }},
-		{Name: "ladder8", build: func(b []byte, h Hello, _ *rand.Rand) Plan { return cut(b, ladder8(h)...) }},
-		{Name: "rec-multi", build: func(b []byte, h Hello, r *rand.Rand) Plan { return recMulti(b, h, r, true) }},
-		{Name: "oob1+rec-5se", build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			return oobAfter(cut(splitRecordAt(b, h, h.HostEnd-5), 1), 0)
-		}},
-		{Name: "oob1+ladder8", build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			return oobAfter(cut(b, append([]int{1}, ladder8(h)...)...), 0)
-		}},
-
-		// The strategies below send some pieces with TTL 1: they die on the way and TCP sends them again after
-		// the pieces that follow, so the path sees the pieces swapped. A loopback or a one-hop path does not drop them.
-		{Name: "disorder-ttl", Experimental: true, build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			p := cut(b, h.MidSLD)
-			p[0].TTL = 1
-			return p
-		}},
-		// Record cut at s+1; the first byte of the stream is the one that gets lost.
-		{Name: "rec1s+disorder1", Experimental: true, build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			p := cut(splitRecordAt(b, h, h.HostStart+1), 1)
-			p[0].TTL = 1
-			return p
-		}},
-		// Cut at s+1; the piece from s+1 to s+3 is the lost one, so the retransmission carries on from there.
-		{Name: "split1s+disorder3s", Experimental: true, build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			p := cut(b, h.HostStart+1, h.HostStart+3)
-			if len(p) == 3 {
-				p[1].TTL = 1
-			}
-			return p
-		}},
-		// Record cut at s+1 and ten cuts after it, every second piece lost on the way.
-		{Name: "ladder-mixed", Experimental: true, build: func(b []byte, h Hello, _ *rand.Rand) Plan {
-			s, rec := h.HostStart, h.HostStart+1
-			var at []int
-			for _, o := range []int{1, s + 3, s + 6, s + 9, s + 12, s + 15, s + 20, s + 25, s + 30, s + 35} {
-				if o > rec {
-					o += 5 // the record header added at s+1 moves everything after it
-				}
-				at = append(at, o)
-			}
-			p := cut(splitRecordAt(b, h, rec), at...)
-			for i := 1; i < len(p); i += 2 {
-				p[i].TTL = 1
-			}
-			return p
-		}},
-	}
-	for i := range l {
-		l[i].seed = seed
+	l := make([]Strategy, len(ladder))
+	for i, e := range ladder {
+		s, err := NewStrategy(i+1, e.name, e.spec, seed)
+		if err != nil {
+			panic(err) // the table is code: TestLadder parses every line
+		}
+		l[i] = s
 	}
 	return l
 }
@@ -156,6 +121,14 @@ func ByName(name string) (Strategy, bool) {
 		if s.Name == name {
 			return s, true
 		}
+	}
+	return Strategy{}, false
+}
+
+// ByNumber finds a strategy of the Ladder by its permanent number.
+func ByNumber(num int) (Strategy, bool) {
+	if l := Ladder(); num >= 1 && num <= len(l) {
+		return l[num-1], true
 	}
 	return Strategy{}, false
 }
@@ -173,24 +146,12 @@ func cut(b []byte, at ...int) Plan {
 	return append(p, Chunk{Data: b[last:]})
 }
 
-// oobAfter puts one urgent byte after chunk i.
-func oobAfter(p Plan, i int) Plan {
-	out := append(Plan{}, p[:i+1]...)
-	out = append(out, Chunk{Data: []byte{oobByte}, OOB: true})
-	return append(out, p[i+1:]...)
-}
-
 // delayed pauses before every chunk but the first.
 func delayed(p Plan, d time.Duration) Plan {
 	for i := 1; i < len(p); i++ {
 		p[i].Delay = d
 	}
 	return p
-}
-
-func ladder8(h Hello) []int {
-	s := h.HostStart
-	return []int{s + 1, s + 3, s + 6, s + 9, s + 12, s + 15, s + 20, s + 30}
 }
 
 // equalCuts returns the boundaries of n equal pieces over [s-2, se+2], edges included.
@@ -203,24 +164,18 @@ func equalCuts(h Hello, n int) []int {
 	return at
 }
 
-// splitRecord rewrites the first TLS record as two records cut inside the server name, headers fixed up.
-// Bytes after the first record are kept as they are.
-func splitRecord(b []byte, h Hello) []byte { return splitRecordAt(b, h, h.MidSLD) }
-
-// splitRecordAt cuts the first record at offset pos of the input (inside its payload); out of range it returns b.
-func splitRecordAt(b []byte, h Hello, pos int) []byte {
-	if pos <= 5 || pos >= h.Rec0End {
-		return b
+// splitRecords rewrites the first TLS record as several, cut at the given offsets of the input (ascending, each
+// inside the payload), headers fixed up. Bytes after the first record are kept as they are.
+func splitRecords(b []byte, h Hello, at []int) []byte {
+	out := make([]byte, 0, len(b)+5*len(at))
+	from := 5
+	for _, to := range append(slices.Clone(at), h.Rec0End) {
+		n := to - from
+		out = append(out, b[0], b[1], b[2], byte(n>>8), byte(n))
+		out = append(out, b[from:to]...)
+		from = to
 	}
-	k := pos - 5 // payload bytes that stay in the first record
-	n := h.Rec0End - 5
-	out := make([]byte, 0, len(b)+5)
-	out = append(out, b[:3]...)
-	out = append(out, byte(k>>8), byte(k))
-	out = append(out, b[5:5+k]...)
-	out = append(out, b[:3]...)
-	out = append(out, byte((n-k)>>8), byte(n-k))
-	return append(out, b[5+k:]...)
+	return append(out, b[h.Rec0End:]...)
 }
 
 // recMulti cuts the payload of the first record into several records, one chunk each: the first three of 3-20
